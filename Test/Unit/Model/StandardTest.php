@@ -27,6 +27,9 @@ use net\authorize\api\contract\v1\MessagesType;
 use net\authorize\api\contract\v1\MessagesType\MessageAType;
 use net\authorize\api\contract\v1\TransactionResponseType;
 use net\authorize\api\contract\v1\TransactionResponseType\ErrorsAType\ErrorAType;
+use net\authorize\api\contract\v1\TransactionResponseType\MessagesAType\MessageAType as TransactionMessage;
+use net\authorize\api\contract\v1\UpdateHeldTransactionRequest;
+use net\authorize\api\contract\v1\UpdateHeldTransactionResponse;
 use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
@@ -47,6 +50,8 @@ class StandardTest extends TestCase
     private Standard $method;
     private ?CreateTransactionRequest $sentRequest = null;
     private ?string $sentEnvironment = null;
+    /** @var list<UpdateHeldTransactionRequest> */
+    private array $heldRequests = [];
 
     protected function setUp(): void
     {
@@ -244,6 +249,185 @@ class StandardTest extends TestCase
         $this->method->refund($this->refundPayment(''), 12.3);
 
         $this->assertSame('4242', $sent[0]->getTransactionRequest()->getPayment()->getCreditCard()->getCardNumber());
+    }
+
+    public function testHeldForReviewGoesToPaymentReview(): void
+    {
+        $transaction = $this->transaction('60124');
+        $transaction->setResponseCode('4');
+        $this->respondWith($this->response('Ok', $transaction));
+        $payment = $this->payment();
+        $payment->expects($this->once())->method('setTransactionId')->with('60124');
+        $payment->expects($this->once())->method('setIsTransactionPending')->with(true);
+        $payment->expects($this->once())->method('setIsFraudDetected')->with(true);
+        $payment->expects($this->once())->method('setIsTransactionClosed')->with(false);
+        $payment->expects($this->once())->method('setAdditionalInformation')->with(Standard::HELD_FOR_REVIEW, 1);
+
+        $this->assertSame($this->method, $this->method->capture($payment, 12.3));
+    }
+
+    public function testApprovedIsNotPending(): void
+    {
+        $this->respondWith($this->response('Ok', $this->transaction('60123')));
+        $payment = $this->payment();
+        $payment->expects($this->never())->method('setIsTransactionPending');
+        $payment->expects($this->never())->method('setIsFraudDetected');
+        $payment->expects($this->once())->method('setIsTransactionClosed')->with(true);
+
+        $this->method->capture($payment, 12.3);
+    }
+
+    /**
+     * Declined (2) with no error list but a transaction message: refused with that message.
+     */
+    public function testDeclinedThrows(): void
+    {
+        $transaction = $this->transaction('60125');
+        $transaction->setResponseCode('2');
+        $message = new TransactionMessage();
+        $message->setCode('2');
+        $message->setDescription('This transaction has been declined.');
+        $transaction->setMessages([$message]);
+        $this->respondWith($this->response('Ok', $transaction));
+        $payment = $this->payment();
+        $payment->expects($this->never())->method('setIsTransactionClosed');
+        $this->expectException(LocalizedException::class);
+        $this->expectExceptionMessage('Your card payment could not be completed: This transaction has been declined.');
+
+        $this->method->capture($payment, 12.3);
+    }
+
+    public function testErrorThrows(): void
+    {
+        $transaction = $this->transaction('0');
+        $transaction->setResponseCode('3');
+        $this->respondWith($this->response('Ok', $transaction));
+        $payment = $this->payment();
+        $payment->expects($this->never())->method('setIsTransactionClosed');
+        $this->expectException(LocalizedException::class);
+        $this->expectExceptionMessage('Your card payment could not be completed: the card was declined (response code 3).');
+
+        $this->method->capture($payment, 12.3);
+    }
+
+    public function testCanReviewPayment(): void
+    {
+        $this->assertTrue($this->method->canReviewPayment());
+    }
+
+    public function testAcceptApproves(): void
+    {
+        $sent = &$this->respondToHeld($this->heldResponse('Ok'));
+        $payment = $this->reviewPayment('60124-capture');
+
+        $this->assertTrue($this->method->acceptPayment($payment));
+
+        $held = $sent[0]->getHeldTransactionRequest();
+        $this->assertSame('approve', $held->getAction());
+        $this->assertSame('60124', $held->getRefTransId());
+        $this->assertSame('100000077', $sent[0]->getRefId());
+        $this->assertSame('login', $sent[0]->getMerchantAuthentication()->getName());
+        $this->assertSame(0, $payment->getAdditionalInformation(Standard::HELD_FOR_REVIEW));
+    }
+
+    public function testDenyDeclines(): void
+    {
+        $sent = &$this->respondToHeld($this->heldResponse('Ok'));
+        $payment = $this->reviewPayment('60124');
+
+        $this->assertTrue($this->method->denyPayment($payment));
+
+        $this->assertSame('decline', $sent[0]->getHeldTransactionRequest()->getAction());
+        $this->assertSame('60124', $sent[0]->getHeldTransactionRequest()->getRefTransId());
+        $this->assertSame(0, $payment->getAdditionalInformation(Standard::HELD_FOR_REVIEW));
+    }
+
+    public function testAcceptRefusedThrows(): void
+    {
+        $this->respondToHeld($this->heldResponse('Error', 'The transaction is not held for review.'));
+        $payment = $this->reviewPayment('60124');
+        $this->expectException(LocalizedException::class);
+        $this->expectExceptionMessage('Authorize.Net refused to approve the payment: The transaction is not held for review.');
+
+        try {
+            $this->method->acceptPayment($payment);
+        } finally {
+            $this->assertSame(1, $payment->getAdditionalInformation(Standard::HELD_FOR_REVIEW));
+        }
+    }
+
+    public function testDenyTransactionErrorThrows(): void
+    {
+        $response = $this->heldResponse('Ok');
+        $response->setTransactionResponse($this->failed('E', 'Decline not allowed.'));
+        $this->respondToHeld($response);
+        $this->expectExceptionMessage('Authorize.Net refused to decline the payment: Decline not allowed.');
+
+        $this->method->denyPayment($this->reviewPayment('60124'));
+    }
+
+    public function testReviewWithoutAnswerThrows(): void
+    {
+        $this->respondToHeld(null);
+        $this->expectExceptionMessage('Authorize.Net is not answering. Please try again.');
+
+        $this->method->acceptPayment($this->reviewPayment('60124'));
+    }
+
+    public function testReviewWithoutTransactionIsRefusedBeforeCallingTheGateway(): void
+    {
+        $this->gateway->expects($this->never())->method('updateHeld');
+        $this->expectExceptionMessage('This order has no Authorize.Net payment to review.');
+
+        $this->method->acceptPayment($this->reviewPayment(''));
+    }
+
+    /**
+     * @return list<UpdateHeldTransactionRequest> filled as the requests are sent (by reference)
+     */
+    private function &respondToHeld(?UpdateHeldTransactionResponse $response): array
+    {
+        $this->heldRequests = [];
+        $this->gateway->method('updateHeld')->willReturnCallback(
+            function (UpdateHeldTransactionRequest $request, string $environment) use ($response) {
+                $this->assertSame(ANetEnvironment::SANDBOX, $environment);
+                $this->heldRequests[] = $request;
+
+                return $response;
+            }
+        );
+
+        return $this->heldRequests;
+    }
+
+    private function heldResponse(string $resultCode, string $text = 'Successful.'): UpdateHeldTransactionResponse
+    {
+        $message = new MessageAType();
+        $message->setCode($resultCode === 'Ok' ? 'I00001' : 'E00027');
+        $message->setText($text);
+        $messages = new MessagesType();
+        $messages->setResultCode($resultCode);
+        $messages->setMessage([$message]);
+        $response = new UpdateHeldTransactionResponse();
+        $response->setMessages($messages);
+
+        return $response;
+    }
+
+    /**
+     * An order in Payment Review, its held transaction last on the payment.
+     */
+    private function reviewPayment(string $lastTransId): Payment
+    {
+        $order = $this->createStub(Order::class);
+        $order->method('getStoreId')->willReturn(1);
+        $order->method('getIncrementId')->willReturn('100000077');
+        $payment = $this->createPartialMock(Payment::class, ['getOrder']);
+        $payment->method('getOrder')->willReturn($order);
+        $payment->setData('last_trans_id', $lastTransId);
+        $payment->setAdditionalInformation(Standard::HELD_FOR_REVIEW, 1);
+
+        return $payment;
     }
 
     /**

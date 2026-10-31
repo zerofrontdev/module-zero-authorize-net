@@ -26,10 +26,14 @@ use net\authorize\api\contract\v1\CreateTransactionRequest;
 use net\authorize\api\contract\v1\CreditCardType;
 use net\authorize\api\contract\v1\CustomerAddressType;
 use net\authorize\api\contract\v1\GetTransactionDetailsRequest;
+use net\authorize\api\contract\v1\HeldTransactionRequestType;
 use net\authorize\api\contract\v1\MerchantAuthenticationType;
 use net\authorize\api\contract\v1\OpaqueDataType;
 use net\authorize\api\contract\v1\PaymentType;
 use net\authorize\api\contract\v1\TransactionRequestType;
+use net\authorize\api\contract\v1\TransactionResponseType;
+use net\authorize\api\contract\v1\UpdateHeldTransactionRequest;
+use net\authorize\api\contract\v1\UpdateHeldTransactionResponse;
 
 /**
  * Authorize.Net card payment (zero_authorizenet). Accept.js turns the card
@@ -37,6 +41,12 @@ use net\authorize\api\contract\v1\TransactionRequestType;
  * the actual charge here (createTransactionRequest, authCaptureTransaction)
  * with that token and the order's own total — same shape as Braintree, unlike
  * Stripe where the charge happens client-side.
+ *
+ * The transaction's response code decides: 1 (approved) pays the order;
+ * 4 (held for review by the Fraud Detection Suite) places it in Payment
+ * Review with status Suspected Fraud, and Accept / Deny on the order
+ * approve or decline the held transaction on Authorize.Net; 2 (declined),
+ * 3 (error) or anything else refuses the order.
  */
 class Standard extends AbstractMethod
 {
@@ -59,6 +69,20 @@ class Standard extends AbstractMethod
      * @var bool
      */
     protected $_canRefundInvoicePartial = true;
+
+    /**
+     * Accept / Deny of an order in Payment Review (a transaction held by Authorize.Net).
+     *
+     * @var bool
+     */
+    protected $_canReviewPayment = true;
+
+    /** Additional information: 1 when Authorize.Net held the transaction for review. */
+    public const HELD_FOR_REVIEW = 'authnet_held_for_review';
+
+    /** transactionResponse.responseCode */
+    private const APPROVED = '1';
+    private const HELD = '4';
 
     /** The payment's card, its last four digits ("1111"): a refund names it. */
     public const CARD_LAST4 = 'authnet_card_last4';
@@ -224,7 +248,22 @@ class Standard extends AbstractMethod
         }
 
         $payment->setTransactionId($transactionResponse->getTransId());
-        $payment->setIsTransactionClosed(true);
+        switch ((string) $transactionResponse->getResponseCode()) {
+            case self::APPROVED:
+                $payment->setIsTransactionClosed(true);
+                break;
+            case self::HELD:
+                // Magento puts the order in Payment Review (status fraud) with an open invoice.
+                $payment->setIsTransactionPending(true);
+                $payment->setIsFraudDetected(true);
+                $payment->setIsTransactionClosed(false);
+                $payment->setAdditionalInformation(self::HELD_FOR_REVIEW, 1);
+                break;
+            default:
+                throw new LocalizedException(
+                    __('Your card payment could not be completed: %1', $this->responseText($transactionResponse))
+                );
+        }
         $last4 = substr(preg_replace('/\D/', '', (string) $transactionResponse->getAccountNumber()), -4);
         if ($last4 !== '') {
             $payment->setAdditionalInformation(self::CARD_LAST4, $last4);
@@ -295,6 +334,87 @@ class Standard extends AbstractMethod
         $payment->setShouldCloseParentTransaction(true);
 
         return $this;
+    }
+
+    /**
+     * Accept on an order in Payment Review: approves the held transaction.
+     *
+     * @return bool true: Magento pays the invoice and the order goes on
+     * @throws LocalizedException when Authorize.Net refuses
+     */
+    public function acceptPayment(InfoInterface $payment)
+    {
+        parent::acceptPayment($payment);
+        $this->updateHeld($payment, 'approve');
+
+        return true;
+    }
+
+    /**
+     * Deny on an order in Payment Review: declines the held transaction.
+     *
+     * @return bool true: Magento cancels the invoice and the order
+     * @throws LocalizedException when Authorize.Net refuses
+     */
+    public function denyPayment(InfoInterface $payment)
+    {
+        parent::denyPayment($payment);
+        $this->updateHeld($payment, 'decline');
+
+        return true;
+    }
+
+    /**
+     * @param string $action approve or decline
+     * @throws LocalizedException
+     */
+    private function updateHeld(InfoInterface $payment, string $action): void
+    {
+        /** @var \Magento\Sales\Model\Order\Payment $payment */
+        $storeId = (int) $payment->getOrder()->getStoreId();
+        $transId = (string) preg_replace('/-(capture|void|refund)$/', '', (string) $payment->getLastTransId());
+        $apiLoginId = $this->authNetConfig->getApiLoginId($storeId);
+        $transactionKey = $this->authNetConfig->getTransactionKey($storeId);
+        if ($transId === '' || $apiLoginId === '' || $transactionKey === '') {
+            throw new LocalizedException(__('This order has no Authorize.Net payment to review.'));
+        }
+        $held = new HeldTransactionRequestType();
+        $held->setAction($action);
+        $held->setRefTransId($transId);
+        $request = new UpdateHeldTransactionRequest();
+        $request->setMerchantAuthentication($this->merchantAuthentication($apiLoginId, $transactionKey));
+        $request->setRefId((string) $payment->getOrder()->getIncrementId());
+        $request->setHeldTransactionRequest($held);
+
+        $response = $this->transactionGateway->updateHeld($request, $this->environment($storeId));
+        if ($response === null || $response->getMessages() === null) {
+            throw new LocalizedException(__('Authorize.Net is not answering. Please try again.'));
+        }
+        $transactionResponse = $response instanceof UpdateHeldTransactionResponse ? $response->getTransactionResponse() : null;
+        $error = null;
+        if ($transactionResponse !== null && $transactionResponse->getErrors()) {
+            $error = (string) $transactionResponse->getErrors()[0]->getErrorText();
+        } elseif ($response->getMessages()->getResultCode() !== 'Ok') {
+            $messages = $response->getMessages()->getMessage();
+            $error = $messages ? (string) $messages[0]->getText() : (string) __('Unknown error.');
+        }
+        if ($error !== null) {
+            throw new LocalizedException($action === 'approve'
+                ? __('Authorize.Net refused to approve the payment: %1', $error)
+                : __('Authorize.Net refused to decline the payment: %1', $error));
+        }
+        $payment->setAdditionalInformation(self::HELD_FOR_REVIEW, 0);
+    }
+
+    /**
+     * What Authorize.Net said about a transaction it didn't approve.
+     */
+    private function responseText(TransactionResponseType $transactionResponse): string
+    {
+        $messages = $transactionResponse->getMessages();
+        $text = $messages ? (string) $messages[0]->getDescription() : '';
+
+        return $text !== '' ? $text : (string) __('the card was declined (response code %1).', (string) $transactionResponse->getResponseCode());
     }
 
     /**
